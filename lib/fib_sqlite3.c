@@ -265,6 +265,93 @@ FibBytesData* fib_sqlite_column_blob(FibSqliteStmt* stmt, int col) {
     return bd;
 }
 
+int fib_sqlite_column_subtype(FibSqliteStmt* stmt, int col) {
+    if (!stmt || !stmt->stmt) return 0;
+    sqlite3_value* val = sqlite3_column_value(stmt->stmt, col);
+    if (!val) return 0;
+    return (int)sqlite3_value_subtype(val);
+}
+
+/* ============================================================================
+ * GC-Safe Wrappers
+ *
+ * The fiberus codegen calls fib_string_data() in argument position to extract
+ * a const char* from FibString. Between that call and the function body, GC
+ * can relocate the FibString, leaving the const char* dangling. The strdup()
+ * inside fib_sqlite_open/exec/prepare is too late -- the pointer is already
+ * invalid.
+ *
+ * These wrappers accept FibString* directly. fib_string_data() + strdup()
+ * happen in the same statement with no yield point between them, so the
+ * const char* cannot be invalidated. The Haxe @:native bindings should point
+ * to these wrappers instead of the original const char* functions.
+ * ============================================================================ */
+
+FibSqliteDb* fib_sqlite_open_safe(FibString* path_str) {
+    if (!path_str) return NULL;
+    char* path = strdup(fib_string_data(path_str));
+    if (!path) return NULL;
+
+    /* Lazily register the Fiberus io_uring VFS on first open */
+    if (!fib_sqlite_vfs_initialized) {
+        fib_sqlite_vfs_register();
+        fib_sqlite_vfs_initialized = 1;
+    }
+
+    sqlite3* db = NULL;
+    int rc = sqlite3_open_v2(path, &db,
+                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                              "fiberus");
+    free(path);
+    if (rc != SQLITE_OK) {
+        if (db) sqlite3_close(db);
+        return NULL;
+    }
+
+    FibSqliteDb* fdb = (FibSqliteDb*)malloc(sizeof(FibSqliteDb));
+    if (!fdb) {
+        sqlite3_close(db);
+        return NULL;
+    }
+    fdb->db = db;
+    return fdb;
+}
+
+int fib_sqlite_exec_safe(FibSqliteDb* db, FibString* sql_str) {
+    if (!db || !db->db || !sql_str) return -1;
+    char* sql = strdup(fib_string_data(sql_str));
+    if (!sql) return -1;
+    char* errmsg = NULL;
+    int rc = sqlite3_exec(db->db, sql, NULL, NULL, &errmsg);
+    free(sql);
+    if (errmsg) sqlite3_free(errmsg);
+    return rc == SQLITE_OK ? 0 : rc;
+}
+
+FibSqliteStmt* fib_sqlite_prepare_safe(FibSqliteDb* db, FibString* sql_str) {
+    if (!db || !db->db || !sql_str) return NULL;
+    char* sql = strdup(fib_string_data(sql_str));
+    if (!sql) return NULL;
+
+    int slen = (int)strlen(sql);
+    sqlite3_stmt* stmt = NULL;
+
+    int rc = sqlite3_prepare_v2(db->db, sql, slen, &stmt, NULL);
+    free(sql);
+    if (rc != SQLITE_OK || !stmt) {
+        return NULL;
+    }
+
+    FibSqliteStmt* fs = (FibSqliteStmt*)malloc(sizeof(FibSqliteStmt));
+    if (!fs) {
+        sqlite3_finalize(stmt);
+        return NULL;
+    }
+    fs->stmt = stmt;
+    fs->db = db;
+    return fs;
+}
+
 /* ============================================================================
  * Null Checks
  * ============================================================================ */

@@ -22,6 +22,9 @@ class ResultSet {
 	public static inline var SQLITE_BLOB:Int = 4;
 	public static inline var SQLITE_NULL:Int = 5;
 
+	/** JSON subtype marker (74 = ASCII 'J'). Set on values returned by json_*() functions. */
+	public static inline var JSON_SUBTYPE:Int = 74;
+
 	/**
 	 * Prepare a SQL statement on the given database connection.
 	 * Throws on error.
@@ -220,5 +223,15 @@ class ResultSet {
 		if (bd == null)
 			return null;
 		return haxe.io.Bytes.ofData(bd);
+	}
+
+	/**
+	 * Get the subtype of a column value (0-indexed).
+	 * Returns 0 for normal values, JSON_SUBTYPE (74) for JSON.
+	 * Use this to detect results from json(), json_array(),
+	 * json_group_array(), json_object(), -> operator, etc.
+	 */
+	public function columnSubtype(col:Int):Int {
+		return Sqlite3Native.columnSubtype(stmt, col);
 	}
 }

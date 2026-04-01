@@ -2,7 +2,7 @@
  * fib_sqlite3 - SQLite3 database factory
  *
  * Provides static methods to open SQLite database connections.
- * Uses the vendored sqlite-3.40.1 amalgamation compiled with
+ * Uses the vendored sqlite-3.51.3 amalgamation compiled with
  * SQLITE_THREADSAFE=0 (single-threaded, appropriate for fiber-per-connection).
  *
  * Usage:

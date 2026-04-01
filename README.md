@@ -1,6 +1,6 @@
 # fib_sqlite3
 
-SQLite3 database library for the Fiberus runtime. Provides Haxe bindings to the SQLite 3.40.1 amalgamation with a custom VFS that routes file I/O through io_uring, allowing fibers to suspend instead of blocking OS threads during database operations.
+SQLite3 database library for the Fiberus runtime. Provides Haxe bindings to the SQLite 3.51.3 amalgamation with a custom VFS that routes file I/O through io_uring, allowing fibers to suspend instead of blocking OS threads during database operations.
 
 ## Architecture
 
@@ -10,12 +10,12 @@ Haxe code -> sqlite3.Connection / sqlite3.ResultSet
           -> fib_sqlite3.c (C wrapper with opaque handles)
           -> sqlite_vfs.c (custom "fiberus" VFS)
           -> io_uring (xRead/xWrite/xSync are non-blocking)
-          -> SQLite 3.40.1 amalgamation (SQLITE_THREADSAFE=0)
+           -> SQLite 3.51.3 amalgamation (SQLITE_THREADSAFE=0)
 ```
 
 The custom VFS wraps the default Unix VFS, replacing only the performance-critical I/O methods (read, write, sync) with io_uring equivalents via `fib_io_pread_raw`, `fib_io_pwrite_raw`, and `fib_io_fsync`. File open/close/lock/stat remain synchronous as they are fast kernel operations. SHM methods for WAL mode are delegated to the Unix VFS.
 
-SQLite is compiled with `SQLITE_THREADSAFE=0` (single-threaded mode) since each fiber uses its own connection.
+SQLite is compiled with `SQLITE_THREADSAFE=0` (single-threaded mode) since each fiber uses its own connection. JSON functions (`json()`, `json_array()`, `json_group_array()`, etc.) and JSONB are fully supported.
 
 ## Directory Structure
 
@@ -26,7 +26,7 @@ fib_sqlite3/
     fib_sqlite3.h          Public C API
     sqlite_vfs.c           Custom "fiberus" VFS (io_uring integration)
     sqlite_vfs.h           VFS registration header
-    sqlite-3.40.1/         Vendored SQLite amalgamation (sqlite3.c, sqlite3.h, sqlite3ext.h)
+    sqlite-3.51.3/         Vendored SQLite amalgamation (sqlite3.c, sqlite3.h, sqlite3ext.h)
   src/sqlite3/
     Sqlite.hx              Factory class (Sqlite.open)
     Connection.hx           Database connection (exec, prepare, close, lastInsertRowId, changes)
@@ -137,6 +137,7 @@ db.close();
 | `columnText(col):String` | Text value (null for SQL NULL). |
 | `columnBytes(col):Int` | Byte size of value. |
 | `columnBlob(col):haxe.io.Bytes` | BLOB value as Bytes (null for SQL NULL). |
+| `columnSubtype(col):Int` | Value subtype (0=normal, 74=JSON). Detects `json_*()` function results. |
 
 ## Building and Testing
 

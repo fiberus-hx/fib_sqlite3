@@ -151,6 +151,24 @@ int         fib_sqlite_column_bytes(FibSqliteStmt* stmt, int col);
  */
 FibBytesData* fib_sqlite_column_blob(FibSqliteStmt* stmt, int col);
 
+/*
+ * Get the subtype of a column value (0-indexed).
+ * Returns 0 for normal values, 74 ('J') for JSON.
+ * Uses sqlite3_column_value() + sqlite3_value_subtype().
+ */
+int fib_sqlite_column_subtype(FibSqliteStmt* stmt, int col);
+
+/* ============================================================================
+ * GC-Safe Wrappers (accept FibString* to avoid dangling const char*)
+ *
+ * Use these in Haxe @:native bindings instead of fib_sqlite_open/exec/prepare.
+ * The original const char* versions remain available for pure C callers.
+ * ============================================================================ */
+
+FibSqliteDb*   fib_sqlite_open_safe(FibString* path);
+int            fib_sqlite_exec_safe(FibSqliteDb* db, FibString* sql);
+FibSqliteStmt* fib_sqlite_prepare_safe(FibSqliteDb* db, FibString* sql);
+
 /* ============================================================================
  * Null Checks (for @:native extern bindings)
  * ============================================================================ */

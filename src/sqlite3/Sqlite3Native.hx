@@ -20,19 +20,24 @@ package sqlite3;
 @:include("fib_sqlite3.h")
 @:sourceFile("../../lib/fib_sqlite3.c")
 @:sourceFile("../../lib/sqlite_vfs.c")
-@:sourceFile("../../lib/sqlite-3.40.1/sqlite3.c")
+@:sourceFile("../../lib/sqlite-3.51.3/sqlite3.c")
 extern class Sqlite3Native {
 	/* ====================================================================
 	 * Database Connection
 	 * ==================================================================== */
 
-	@:native("fib_sqlite_open")
+	/* open/exec/prepare use GC-safe wrappers that accept FibString* directly.
+	 * The _safe suffix tells the fiberus codegen to NOT insert fib_string_data()
+	 * for String parameters, passing FibString* directly. The C wrappers then
+	 * call fib_string_data() + strdup() atomically, preventing GC from
+	 * relocating the string between extraction and copy. */
+	@:native("fib_sqlite_open_safe")
 	static function open(path:String):FibSqliteDbPtr;
 
 	@:native("fib_sqlite_close")
 	static function close(db:FibSqliteDbPtr):Void;
 
-	@:native("fib_sqlite_exec")
+	@:native("fib_sqlite_exec_safe")
 	static function exec(db:FibSqliteDbPtr, sql:String):Int;
 
 	@:native("fib_sqlite_errmsg")
@@ -48,7 +53,7 @@ extern class Sqlite3Native {
 	 * Prepared Statements
 	 * ==================================================================== */
 
-	@:native("fib_sqlite_prepare")
+	@:native("fib_sqlite_prepare_safe")
 	static function prepare(db:FibSqliteDbPtr, sql:String):FibSqliteStmtPtr;
 
 	@:native("fib_sqlite_step")
@@ -121,6 +126,9 @@ extern class Sqlite3Native {
 
 	@:native("fib_sqlite_column_blob")
 	static function columnBlob(stmt:FibSqliteStmtPtr, col:Int):haxe.io.BytesData;
+
+	@:native("fib_sqlite_column_subtype")
+	static function columnSubtype(stmt:FibSqliteStmtPtr, col:Int):Int;
 
 	/* ====================================================================
 	 * Null Checks
