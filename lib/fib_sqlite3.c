@@ -4,12 +4,18 @@
  * Part of the fib_sqlite3 library (libraries/fib_sqlite3).
  * Implements the C wrapper functions declared in fib_sqlite3.h.
  * All memory returned to Haxe land (FibString, FibBytesData) is
- * GC-managed. SQLite's own allocations (sqlite3*, sqlite3_stmt*)
- * are malloc-based and manually freed.
+ * GC-managed.
+ *
+ * FibSqliteDb and FibSqliteStmt wrapper structs are allocated with
+ * malloc (not the GC heap) since they contain only raw C pointers
+ * that the GC cannot trace. Their internal SQLite resources
+ * (sqlite3_stmt, sqlite3 handles) AND the wrapper memory are both
+ * released explicitly via close/finalize.
  */
 
 #include "fib_sqlite3.h"
 #include "sqlite_vfs.h"
+#include "fib_sqlite_mutex.h"
 #include "fibstring.h"
 #include "bytes.h"
 
@@ -19,8 +25,50 @@
 #include <string.h>
 #include <stdio.h>
 
-/* VFS registration state - lazily initialized on first open */
-static int fib_sqlite_vfs_initialized = 0;
+/* gc_pin_object pins cross-fiber-shared objects at depth 0. */
+extern void gc_pin_object(void* obj);
+
+/* FibSqliteDb/FibSqliteStmt are malloc'd (not GC-managed) since they
+ * contain only raw C pointers that the GC cannot trace.  Using the GC
+ * heap (fibrix_alloc) with @:coreType Haxe types caused the GC
+ * recycler to treat live wrappers as holes and overwrite them. */
+
+/* One-shot init covers BOTH the fiber-aware mutex backend install AND
+ * the io_uring VFS registration. Use an atomic 3-state flag:
+ * 0=uninitialized, 1=initializing, 2=ready.
+ *
+ * Ordering inside the init block matters:
+ *   1. sqlite3_config(SQLITE_CONFIG_MUTEX, &fib_sqlite_mutex_methods) —
+ *      MUST run BEFORE sqlite3_initialize. SQLite forbids changing the
+ *      mutex backend once initialize has run.
+ *   2. sqlite3_initialize() — explicit so subsequent sqlite3_* calls
+ *      (including the implicit init inside sqlite3_vfs_register) are
+ *      no-ops rather than first-init.
+ *   3. fib_sqlite_vfs_register() — installs the io_uring VFS.
+ *
+ * Without (1) before (2), SQLite defaults to its pthread mutex backend,
+ * which OS-thread-blocks the carrier on contention. */
+static volatile int fib_sqlite_vfs_initialized = 0;
+
+static inline void fib_sqlite_ensure_vfs_registered(void) {
+    if (__atomic_load_n(&fib_sqlite_vfs_initialized, __ATOMIC_ACQUIRE) == 2) {
+        return;
+    }
+    int expected = 0;
+    if (__atomic_compare_exchange_n(&fib_sqlite_vfs_initialized,
+                                    &expected, 1,
+                                    0, __ATOMIC_ACQ_REL,
+                                    __ATOMIC_ACQUIRE)) {
+        sqlite3_config(SQLITE_CONFIG_MUTEX, &fib_sqlite_mutex_methods);
+        sqlite3_initialize();
+        fib_sqlite_vfs_register();
+        __atomic_store_n(&fib_sqlite_vfs_initialized, 2, __ATOMIC_RELEASE);
+    } else {
+        while (__atomic_load_n(&fib_sqlite_vfs_initialized, __ATOMIC_ACQUIRE) != 2) {
+            /* Brief spin — init completes in microseconds. */
+        }
+    }
+}
 
 /* ============================================================================
  * Internal Structures
@@ -32,7 +80,22 @@ struct FibSqliteDb {
 
 struct FibSqliteStmt {
     sqlite3_stmt* stmt;
-    FibSqliteDb*  db;    /* Back-pointer to owning connection (for errmsg) */
+    FibSqliteDb*  db;            /* Back-pointer to owning connection (for errmsg) */
+    /* Column name cache: caches the raw const char* pointers from
+     * sqlite3_column_name (which returns pointers to SQLite's internal
+     * persistent storage, valid for the prepared statement's lifetime).
+     *
+     * Each fib_sqlite_column_name call creates a fresh fiber-local
+     * FibString from the cached C string — NO gc_pin_object, NO membrane
+     * capability, NO static root registration. The FibString lives only
+     * for the caller's request scope and is collected normally on fiber
+     * exit, unblocking the region-free fast path.
+     *
+     * This replaces the original code which called fib_string_new +
+     * gc_pin_object on EVERY column-name read (one per row × column per
+     * handler), producing ~1.8M capabilities per tecdoc-api load run. */
+    const char**  column_names;
+    int           column_count;
 };
 
 /* ============================================================================
@@ -42,11 +105,8 @@ struct FibSqliteStmt {
 FibSqliteDb* fib_sqlite_open(const char* path) {
     if (!path) return NULL;
 
-    /* Lazily register the Fiberus io_uring VFS on first open */
-    if (!fib_sqlite_vfs_initialized) {
-        fib_sqlite_vfs_register();
-        fib_sqlite_vfs_initialized = 1;
-    }
+    /* Lazily + atomically register the Fiberus io_uring VFS on first open */
+    fib_sqlite_ensure_vfs_registered();
 
     sqlite3* db = NULL;
     /* Open using the "fiberus" VFS - routes read/write/sync through io_uring.
@@ -124,6 +184,8 @@ FibSqliteStmt* fib_sqlite_prepare(FibSqliteDb* db, const char* sql) {
     }
     fs->stmt = stmt;
     fs->db = db;
+    fs->column_names = NULL;  /* Populated lazily in fib_sqlite_column_name */
+    fs->column_count = 0;
     return fs;
 }
 
@@ -136,8 +198,30 @@ int fib_sqlite_step(FibSqliteStmt* stmt) {
 }
 
 int fib_sqlite_reset(FibSqliteStmt* stmt) {
+    if (!stmt) {
+        fprintf(stderr, "[SQLITE-RESET] stmt=NULL\n");
+        fflush(stderr);
+        return -1;
+    }
+    if (!stmt->stmt) {
+        fprintf(stderr, "[SQLITE-RESET] stmt->stmt=NULL (stmt=%p db=%p)\n",
+                (void*)stmt, (void*)stmt->db);
+        fflush(stderr);
+        return -1;
+    }
+    int rc = sqlite3_reset(stmt->stmt);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "[SQLITE-RESET] sqlite3_reset failed rc=%d: %s\n",
+                rc, (stmt->db && stmt->db->db) ? sqlite3_errmsg(stmt->db->db) : "no-db");
+        fflush(stderr);
+        return -1;
+    }
+    return 0;
+}
+
+int fib_sqlite_clear_bindings(FibSqliteStmt* stmt) {
     if (!stmt || !stmt->stmt) return -1;
-    return sqlite3_reset(stmt->stmt) == SQLITE_OK ? 0 : -1;
+    return sqlite3_clear_bindings(stmt->stmt) == SQLITE_OK ? 0 : -1;
 }
 
 void fib_sqlite_finalize(FibSqliteStmt* stmt) {
@@ -146,6 +230,14 @@ void fib_sqlite_finalize(FibSqliteStmt* stmt) {
         sqlite3_finalize(stmt->stmt);
         stmt->stmt = NULL;
     }
+    /* Free the C-string cache array. The const char* pointers inside
+     * belong to SQLite (freed when the statement is finalized above). */
+    if (stmt->column_names) {
+        free(stmt->column_names);
+        stmt->column_names = NULL;
+        stmt->column_count = 0;
+    }
+    stmt->db = NULL;
     free(stmt);
 }
 
@@ -292,11 +384,8 @@ FibSqliteDb* fib_sqlite_open_safe(FibString* path_str) {
     char* path = strdup(fib_string_data(path_str));
     if (!path) return NULL;
 
-    /* Lazily register the Fiberus io_uring VFS on first open */
-    if (!fib_sqlite_vfs_initialized) {
-        fib_sqlite_vfs_register();
-        fib_sqlite_vfs_initialized = 1;
-    }
+    /* Lazily + atomically register the Fiberus io_uring VFS on first open */
+    fib_sqlite_ensure_vfs_registered();
 
     sqlite3* db = NULL;
     int rc = sqlite3_open_v2(path, &db,
@@ -349,11 +438,13 @@ FibSqliteStmt* fib_sqlite_prepare_safe(FibSqliteDb* db, FibString* sql_str) {
     }
     fs->stmt = stmt;
     fs->db = db;
+    fs->column_names = NULL;
+    fs->column_count = 0;
     return fs;
 }
 
 /* ============================================================================
- * Null Checks
+ * Binding Parameters (1-indexed)
  * ============================================================================ */
 
 int fib_sqlite_db_is_null(FibSqliteDb* db) {
@@ -362,4 +453,40 @@ int fib_sqlite_db_is_null(FibSqliteDb* db) {
 
 int fib_sqlite_stmt_is_null(FibSqliteStmt* stmt) {
     return stmt == NULL ? 1 : 0;
+}
+
+/* ============================================================================
+ * Memory telemetry
+ * ============================================================================ */
+
+int64_t fib_sqlite_memory_used(void) {
+    return (int64_t)sqlite3_memory_used();
+}
+
+int64_t fib_sqlite_memory_highwater(void) {
+    return (int64_t)sqlite3_memory_highwater(0);
+}
+
+int fib_sqlite_db_cache_used(FibSqliteDb* db) {
+    if (!db || !db->db) return 0;
+    int cur = 0, hwm = 0;
+    if (sqlite3_db_status(db->db, SQLITE_DBSTATUS_CACHE_USED, &cur, &hwm, 0) != SQLITE_OK)
+        return 0;
+    return cur;
+}
+
+int fib_sqlite_db_schema_used(FibSqliteDb* db) {
+    if (!db || !db->db) return 0;
+    int cur = 0, hwm = 0;
+    if (sqlite3_db_status(db->db, SQLITE_DBSTATUS_SCHEMA_USED, &cur, &hwm, 0) != SQLITE_OK)
+        return 0;
+    return cur;
+}
+
+int fib_sqlite_db_stmt_used(FibSqliteDb* db) {
+    if (!db || !db->db) return 0;
+    int cur = 0, hwm = 0;
+    if (sqlite3_db_status(db->db, SQLITE_DBSTATUS_STMT_USED, &cur, &hwm, 0) != SQLITE_OK)
+        return 0;
+    return cur;
 }

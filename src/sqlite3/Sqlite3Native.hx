@@ -13,12 +13,13 @@ package sqlite3;
 
 @:buildXml('
 	<files id="__externs__">
-		<compilerflag value="-DSQLITE_THREADSAFE=0"/>
+		<compilerflag value="-DSQLITE_THREADSAFE=1"/>
 		<compilerflag value="-DSQLITE_OMIT_LOAD_EXTENSION"/>
 	</files>
 ')
 @:include("fib_sqlite3.h")
 @:sourceFile("../../lib/fib_sqlite3.c")
+@:sourceFile("../../lib/fib_sqlite_mutex.c")
 @:sourceFile("../../lib/sqlite_vfs.c")
 @:sourceFile("../../lib/sqlite-3.51.3/sqlite3.c")
 extern class Sqlite3Native {
@@ -61,6 +62,9 @@ extern class Sqlite3Native {
 
 	@:native("fib_sqlite_reset")
 	static function reset(stmt:FibSqliteStmtPtr):Int;
+
+	@:native("fib_sqlite_clear_bindings")
+	static function clearBindings(stmt:FibSqliteStmtPtr):Int;
 
 	@:native("fib_sqlite_finalize")
 	static function finalize(stmt:FibSqliteStmtPtr):Void;
@@ -139,4 +143,23 @@ extern class Sqlite3Native {
 
 	@:native("fib_sqlite_stmt_is_null")
 	static function stmtIsNull(stmt:FibSqliteStmtPtr):Int;
+
+	/* ====================================================================
+	 * Memory telemetry
+	 * ==================================================================== */
+
+	@:native("fib_sqlite_memory_used")
+	static function memoryUsed():haxe.Int64;
+
+	@:native("fib_sqlite_memory_highwater")
+	static function memoryHighwater():haxe.Int64;
+
+	@:native("fib_sqlite_db_cache_used")
+	static function dbCacheUsed(db:FibSqliteDbPtr):Int;
+
+	@:native("fib_sqlite_db_schema_used")
+	static function dbSchemaUsed(db:FibSqliteDbPtr):Int;
+
+	@:native("fib_sqlite_db_stmt_used")
+	static function dbStmtUsed(db:FibSqliteDbPtr):Int;
 }
