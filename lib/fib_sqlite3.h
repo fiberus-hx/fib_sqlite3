@@ -89,6 +89,12 @@ int fib_sqlite_step(FibSqliteStmt* stmt);
 int fib_sqlite_reset(FibSqliteStmt* stmt);
 
 /*
+ * Clear all parameter bindings on a prepared statement (sets all to NULL).
+ * Returns 0 on success.
+ */
+int fib_sqlite_clear_bindings(FibSqliteStmt* stmt);
+
+/*
  * Finalize (destroy) a prepared statement.
  */
 void fib_sqlite_finalize(FibSqliteStmt* stmt);
@@ -182,6 +188,25 @@ int fib_sqlite_db_is_null(FibSqliteDb* db);
  * Check if a statement handle is NULL. Returns 1 if null, 0 otherwise.
  */
 int fib_sqlite_stmt_is_null(FibSqliteStmt* stmt);
+
+/* ============================================================================
+ * Memory telemetry
+ * ============================================================================ */
+
+/* Process-wide SQLite heap bytes (sqlite3_memory_used). */
+int64_t fib_sqlite_memory_used(void);
+
+/* Process-wide SQLite heap highwater (sqlite3_memory_highwater, no reset). */
+int64_t fib_sqlite_memory_highwater(void);
+
+/* Per-connection page cache bytes currently used. */
+int fib_sqlite_db_cache_used(FibSqliteDb* db);
+
+/* Per-connection memory used by all schemas. */
+int fib_sqlite_db_schema_used(FibSqliteDb* db);
+
+/* Per-connection memory used by all prepared statements. */
+int fib_sqlite_db_stmt_used(FibSqliteDb* db);
 
 #ifdef __cplusplus
 }

@@ -37,6 +37,7 @@ import sqlite3.Connection;
 import sqlite3.ResultSet;
 import fiberus.Counter;
 import fiberus.Fiber;
+import fiberus.GC;
 import haxe.atomic.AtomicInt;
 
 typedef PoolConfig = {
@@ -253,6 +254,7 @@ class ConnectionPool {
 		if (freeConns.length > 0) {
 			var pc = freeConns.pop();
 			spinUnlock();
+			GC.registerPendingRoot(pc);
 			return pc;
 		}
 		// Park: allocate Waiter, queue, release lock, wait.
@@ -264,6 +266,7 @@ class ConnectionPool {
 		// release() wrote handoff before decrement(); SEQ_CST gives us visibility.
 		if (w.handoff == null)
 			throw "ConnectionPool was closed while acquire() was waiting";
+		GC.registerPendingRoot(w.handoff);
 		return w.handoff;
 	}
 
@@ -272,6 +275,7 @@ class ConnectionPool {
 	 * If the pool is closed, the connection is destroyed instead.
 	 */
 	public function release(pc:PooledConnection):Void {
+		GC.unregisterPendingRoot(pc);
 		if (closed) {
 			pc.destroy();
 			return;
@@ -295,15 +299,20 @@ class ConnectionPool {
 	 */
 	public function withConnection<T>(fn:PooledConnection -> T):T {
 		var pc = acquire();
+		GC.registerPendingRoot(fn);
 		try {
 			var result = fn(pc);
 			pc.release();
+			GC.unregisterPendingRoot(fn);
 			return result;
 		} catch (e:Dynamic) {
 			pc.release();
+			GC.unregisterPendingRoot(fn);
 			throw e;
 		}
 	}
+
+
 
 	/**
 	 * Close the pool: drain idle conns, signal pending waiters, destroy all.

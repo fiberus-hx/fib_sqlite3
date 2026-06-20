@@ -146,7 +146,26 @@ class ResultSet {
 	}
 
 	/**
+	 * Clear all parameter bindings (sets all to NULL).
+	 * Call after reset() before re-binding for cached statement reuse.
+	 */
+	public function clearBindings():Void {
+		var rc:Int = Sqlite3Native.clearBindings(stmt);
+		if (rc != 0)
+			throw "SQLite clear_bindings error";
+	}
+
+	/**
 	 * Finalize and release the statement. Must not be used after this.
+	 *
+	 * The FibSqliteStmt wrapper is malloc'd (NOT GC-tracked) and owns the
+	 * underlying sqlite3_stmt. You MUST call close() before dropping the
+	 * last reference to this ResultSet, otherwise both the wrapper and
+	 * the SQLite statement leak permanently.
+	 *
+	 * ConnectionPool.cachedPrepare handles this automatically: cached
+	 * statements are evicted via close() on cache overflow and on pool
+	 * destroy(). queryDynamic also closes explicitly after iteration.
 	 */
 	public function close():Void {
 		Sqlite3Native.finalize(stmt);
