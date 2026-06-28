@@ -64,6 +64,13 @@ int64_t fib_sqlite_last_insert_rowid(FibSqliteDb* db);
  */
 int fib_sqlite_changes(FibSqliteDb* db);
 
+/*
+ * Extended result code of the most recent failed API call on this connection.
+ * Distinguishes SQLITE_BUSY_SNAPSHOT (517) from SQLITE_BUSY (5) — required for
+ * BEGIN CONCURRENT conflict-retry.
+ */
+int fib_sqlite_extended_errcode(FibSqliteDb* db);
+
 /* ============================================================================
  * Prepared Statements
  * ============================================================================ */

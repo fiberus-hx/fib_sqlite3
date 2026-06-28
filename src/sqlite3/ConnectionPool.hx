@@ -81,6 +81,51 @@ private class Waiter {
 }
 
 /**
+ * FIFO fiber lock serializing COMMITs. A contending fiber PARKS on a Counter
+ * during the ms-scale commit fsync instead of busy-retrying the WAL writer lock.
+ * Ownership is handed off directly on unlock (same pattern as the pool's
+ * acquire/release), preserving FIFO fairness.
+ */
+private class CommitLock {
+	var held:Bool;
+	var waiters:Array<Counter>;
+	var lk:AtomicInt;
+	public function new() { held = false; waiters = []; lk = new AtomicInt(0); }
+
+	public function lock():Void {
+		spin();
+		if (!held) { held = true; lk.store(0); return; }
+		var w = Counter.create(1);
+		waiters.push(w);
+		lk.store(0);
+		w.wait(0);
+		w.done();
+		// ownership was handed to us by unlock(); `held` stays true.
+	}
+
+	public function unlock():Void {
+		spin();
+		if (waiters.length > 0) {
+			var w = waiters.shift();
+			lk.store(0);
+			w.decrement(); // hand off ownership; `held` stays true
+			return;
+		}
+		held = false;
+		lk.store(0);
+	}
+
+	function spin():Void {
+		if (lk.compareExchange(0, 1) == 0) return;
+		var n = 0;
+		while (true) {
+			if (lk.compareExchange(0, 1) == 0) return;
+			if ((++n & 0x7) == 0) Fiber.yield();
+		}
+	}
+}
+
+/**
  * A pooled connection wrapping a raw Connection with a statement cache.
  * Obtained via ConnectionPool.acquire(), returned via release().
  */
@@ -209,6 +254,8 @@ class ConnectionPool {
 	var waiters:Array<Waiter>;
 	/** Spinlock protecting freeConns + waiters (0 = unlocked, 1 = locked). */
 	var queueLock:AtomicInt;
+	/** Serializes COMMITs so contending fibers park during the commit fsync. */
+	var commitLock:CommitLock;
 
 	function new(_path:String, _config:PoolConfig) {
 		path = _path;
@@ -218,6 +265,7 @@ class ConnectionPool {
 		freeConns = [];
 		waiters = [];
 		queueLock = new AtomicInt(0);
+		commitLock = new CommitLock();
 	}
 
 	/**
@@ -312,6 +360,94 @@ class ConnectionPool {
 		}
 	}
 
+	/**
+	 * Run `fn` inside a BEGIN CONCURRENT write transaction with automatic
+	 * conflict retry. Many fibers can build write transactions in parallel;
+	 * COMMITs are serialized by CommitLock. On SQLITE_BUSY_SNAPSHOT (517) — a
+	 * page-level conflict, which can surface mid-transaction or at COMMIT — the
+	 * transaction is rolled back and retried after a fiber yield, up to
+	 * `maxRetries`. Any other error rolls back and rethrows. `fn` must therefore
+	 * be re-runnable (re-read then re-write); it may be invoked multiple times.
+	 *
+	 * Do NOT nest transaction()/read()/withConnection() on one fiber — each holds
+	 * a pooled connection for its whole body, so nesting can exhaust the pool and
+	 * deadlock.
+	 */
+	public function transaction<T>(fn:PooledConnection -> T, maxRetries:Int = 256):T {
+		var pc = acquire();
+		GC.registerPendingRoot(fn);
+		var attempt = 0;
+		while (true) {
+			try {
+				pc.exec("BEGIN CONCURRENT");
+				var result = fn(pc);
+				commitLock.lock();
+				try {
+					pc.exec("COMMIT");
+				} catch (ce:Dynamic) {
+					commitLock.unlock();
+					throw ce;
+				}
+				commitLock.unlock();
+				pc.release();
+				GC.unregisterPendingRoot(fn);
+				return result;
+			} catch (e:Dynamic) {
+				// Sample the conflict status BEFORE rollback — a successful ROLLBACK
+				// resets sqlite3_extended_errcode, erasing the BUSY/517 code.
+				var conflict = isConflict(pc);
+				safeRollback(pc);
+				if (conflict && attempt < maxRetries) {
+					attempt++;
+					// Escalating backoff: yield progressively more so contending
+					// fibers spread out instead of re-colliding in a thundering herd
+					// under heavy single-page contention.
+					var spins = attempt < 64 ? attempt : 64;
+					for (_ in 0...spins) Fiber.yield();
+					continue;
+				}
+				pc.release();
+				GC.unregisterPendingRoot(fn);
+				throw e;
+			}
+		}
+	}
+
+	/**
+	 * Run `fn` inside a read transaction (consistent WAL snapshot). No commit
+	 * lock and no retry — WAL readers never block writers or each other.
+	 */
+	public function read<T>(fn:PooledConnection -> T):T {
+		var pc = acquire();
+		GC.registerPendingRoot(fn);
+		try {
+			pc.exec("BEGIN");
+			var result = fn(pc);
+			pc.exec("COMMIT");
+			pc.release();
+			GC.unregisterPendingRoot(fn);
+			return result;
+		} catch (e:Dynamic) {
+			safeRollback(pc);
+			pc.release();
+			GC.unregisterPendingRoot(fn);
+			throw e;
+		}
+	}
+
+	/** True if the last error is a retryable BUSY/conflict. The primary code
+	 * SQLITE_BUSY (5) covers BUSY, BUSY_SNAPSHOT (517 — a BEGIN CONCURRENT page
+	 * conflict at COMMIT), BUSY_RECOVERY (261) and BUSY_TIMEOUT (773); all mean
+	 * "roll back and retry the transaction". */
+	inline function isConflict(pc:PooledConnection):Bool {
+		return (Sqlite3Native.extendedErrcode(@:privateAccess pc.conn.db) & 0xFF) == 5;
+	}
+
+	/** Roll back, swallowing errors (the tx may already be auto-rolled-back). */
+	inline function safeRollback(pc:PooledConnection):Void {
+		try pc.exec("ROLLBACK") catch (_:Dynamic) {}
+	}
+
 
 
 	/**
@@ -339,6 +475,13 @@ class ConnectionPool {
 
 	function openNew():PooledConnection {
 		var conn = Sqlite.open(path);
+		// begin-concurrent requires WAL; NORMAL is the WAL-safe durability default.
+		// busy_timeout is only a fallback — our xSleep is an io_uring fiber-yield,
+		// and COMMIT contention is handled by CommitLock + the 517 retry. Set before
+		// onConnect so apps can still override via config.onConnect.
+		conn.exec("PRAGMA journal_mode=WAL");
+		conn.exec("PRAGMA synchronous=NORMAL");
+		conn.exec("PRAGMA busy_timeout=5000");
 		if (config.onConnect != null)
 			config.onConnect(conn);
 		var cacheSize = config.stmtCacheSize ?? 256;

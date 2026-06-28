@@ -2,8 +2,8 @@
  * fib_sqlite3 - SQLite3 database factory
  *
  * Provides static methods to open SQLite database connections.
- * Uses the vendored sqlite-3.51.3 amalgamation compiled with
- * SQLITE_THREADSAFE=0 (single-threaded, appropriate for fiber-per-connection).
+ * Uses the vendored sqlite-begin-concurrent (3.54.0) amalgamation compiled with
+ * SQLITE_THREADSAFE=1 and a custom fiber-aware mutex (see lib/fib_sqlite_mutex.c).
  *
  * Usage:
  *   var db = Sqlite.open("mydb.sqlite");

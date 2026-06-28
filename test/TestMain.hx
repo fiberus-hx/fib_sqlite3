@@ -10,6 +10,12 @@ class TestMain {
 		sqliteTests.runTests();
 
 		trace("");
+		trace("--- TestConcurrent ---");
+		var concurrentTests = new TestConcurrent();
+		concurrentTests.setFramework(framework);
+		concurrentTests.runTests();
+
+		trace("");
 		framework.printSummary();
 	}
 }

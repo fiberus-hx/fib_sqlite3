@@ -15,13 +15,14 @@ package sqlite3;
 	<files id="__externs__">
 		<compilerflag value="-DSQLITE_THREADSAFE=1"/>
 		<compilerflag value="-DSQLITE_OMIT_LOAD_EXTENSION"/>
+		<compilerflag value="-DSQLITE_ENABLE_FTS5"/>
 	</files>
 ')
 @:include("fib_sqlite3.h")
 @:sourceFile("../../lib/fib_sqlite3.c")
 @:sourceFile("../../lib/fib_sqlite_mutex.c")
 @:sourceFile("../../lib/sqlite_vfs.c")
-@:sourceFile("../../lib/sqlite-3.51.3/sqlite3.c")
+@:sourceFile("../../lib/sqlite-begin-concurrent-20260628/sqlite3.c")
 extern class Sqlite3Native {
 	/* ====================================================================
 	 * Database Connection
@@ -49,6 +50,11 @@ extern class Sqlite3Native {
 
 	@:native("fib_sqlite_changes")
 	static function changes(db:FibSqliteDbPtr):Int;
+
+	/* Extended result code of the last failed call — distinguishes
+	 * SQLITE_BUSY_SNAPSHOT (517) from SQLITE_BUSY (5) for BEGIN CONCURRENT retry. */
+	@:native("fib_sqlite_extended_errcode")
+	static function extendedErrcode(db:FibSqliteDbPtr):Int;
 
 	/* ====================================================================
 	 * Prepared Statements

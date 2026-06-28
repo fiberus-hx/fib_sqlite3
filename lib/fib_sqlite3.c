@@ -162,6 +162,14 @@ int fib_sqlite_changes(FibSqliteDb* db) {
     return sqlite3_changes(db->db);
 }
 
+/* Extended result code of the most recent failed API call on this connection.
+ * Needed to distinguish SQLITE_BUSY_SNAPSHOT (517) from plain SQLITE_BUSY (5)
+ * for BEGIN CONCURRENT conflict-retry. */
+int fib_sqlite_extended_errcode(FibSqliteDb* db) {
+    if (!db || !db->db) return 0;
+    return sqlite3_extended_errcode(db->db);
+}
+
 /* ============================================================================
  * Prepared Statements
  * ============================================================================ */

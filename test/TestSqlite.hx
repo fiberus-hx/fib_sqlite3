@@ -21,6 +21,7 @@ class TestSqlite extends Test {
 		testNamedParameters();
 		testFloat64Precision();
 		testColumnNames();
+		testFts5();
 	}
 
 	function testOpenClose() {
@@ -333,6 +334,40 @@ class TestSqlite extends Test {
 		eqStr("beta", rs.columnName(1));
 		eqStr("gamma", rs.columnName(2));
 		rs.close();
+		db.close();
+	}
+
+	// SPIKE: proves -DSQLITE_ENABLE_FTS5 compiled into the amalgamation and that
+	// MATCH + the bm25() ranking aux function work at the raw fib_sqlite3 layer.
+	function testFts5() {
+		framework.startTest("testFts5");
+		var db = Sqlite.open(":memory:");
+		db.exec("CREATE VIRTUAL TABLE docs USING fts5(title, body)");
+		db.exec("INSERT INTO docs (title, body) VALUES ('Deploy runbook', 'how to deploy the service to production')");
+		db.exec("INSERT INTO docs (title, body) VALUES ('Backup policy', 'database backups run nightly')");
+		db.exec("INSERT INTO docs (title, body) VALUES ('Deploy rollback', 'rolling back a bad deploy quickly')");
+
+		// MATCH: 'deploy' hits rows 1 and 3, not row 2.
+		var rs = db.prepare("SELECT title FROM docs WHERE docs MATCH 'deploy' ORDER BY rank");
+		var n = 0;
+		while (rs.step())
+			n++;
+		rs.close();
+		eq(2, n);
+
+		// bm25(): ranking fn returns a real score (negative for a match) — proves the aux fn is available.
+		var rk = db.prepare("SELECT title, bm25(docs) AS score FROM docs WHERE docs MATCH 'deploy' ORDER BY score");
+		t(rk.step());
+		var score = rk.columnFloat(1);
+		t(score != 0.0);
+		rk.close();
+
+		// phrase + column filter: only the body mentions 'production'.
+		var ph = db.prepare("SELECT count(*) FROM docs WHERE docs MATCH 'production'");
+		t(ph.step());
+		eq(1, ph.columnInt(0));
+		ph.close();
+
 		db.close();
 	}
 }
