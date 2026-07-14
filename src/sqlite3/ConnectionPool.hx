@@ -256,6 +256,12 @@ class ConnectionPool {
 	var queueLock:AtomicInt;
 	/** Serializes COMMITs so contending fibers park during the commit fsync. */
 	var commitLock:CommitLock;
+	/** Cumulative BEGIN CONCURRENT conflicts retried by transaction(). A rising
+	 *  conflicts-per-commit ratio under load is the early signal that writers
+	 *  contend on shared hot pages (FTS shadow tables, append leaves). */
+	public var conflictRetries(default, null):AtomicInt;
+	/** transaction() calls that exhausted their retry budget and threw. */
+	public var retryExhaustions(default, null):AtomicInt;
 
 	function new(_path:String, _config:PoolConfig) {
 		path = _path;
@@ -266,6 +272,8 @@ class ConnectionPool {
 		waiters = [];
 		queueLock = new AtomicInt(0);
 		commitLock = new CommitLock();
+		conflictRetries = new AtomicInt(0);
+		retryExhaustions = new AtomicInt(0);
 	}
 
 	/**
@@ -399,6 +407,7 @@ class ConnectionPool {
 				safeRollback(pc);
 				if (conflict && attempt < maxRetries) {
 					attempt++;
+					conflictRetries.add(1);
 					// Escalating backoff: yield progressively more so contending
 					// fibers spread out instead of re-colliding in a thundering herd
 					// under heavy single-page contention.
@@ -408,6 +417,13 @@ class ConnectionPool {
 				}
 				pc.release();
 				GC.unregisterPendingRoot(fn);
+				if (conflict) {
+					// Budget exhausted, not a first-hit failure: without the attempt
+					// count, this surfaces as a bare "database is locked" and is
+					// indistinguishable from an unretried error at the crash site.
+					retryExhaustions.add(1);
+					throw "BEGIN CONCURRENT retry budget exhausted after " + attempt + " attempts: " + Std.string(e);
+				}
 				throw e;
 			}
 		}
