@@ -22,6 +22,7 @@ class TestSqlite extends Test {
 		testFloat64Precision();
 		testColumnNames();
 		testFts5();
+		testRegexpAndMath();
 	}
 
 	function testOpenClose() {
@@ -367,6 +368,38 @@ class TestSqlite extends Test {
 		t(ph.step());
 		eq(1, ph.columnInt(0));
 		ph.close();
+
+		db.close();
+	}
+
+	// SPIKE: proves the vendored ext/misc/regexp.c auto-extension is registered
+	// (regexp()/regexpi() + REGEXP operator) and -DSQLITE_ENABLE_MATH_FUNCTIONS
+	// compiled the math functions into the amalgamation.
+	function testRegexpAndMath() {
+		framework.startTest("testRegexpAndMath");
+		var db = Sqlite.open(":memory:");
+
+		// REGEXP operator (routes to regexp(pattern, string)).
+		var rs = db.prepare("SELECT 'deploy-42' REGEXP '^deploy-[0-9]+$', 'rollback' REGEXP '^deploy-[0-9]+$'");
+		t(rs.step());
+		eq(1, rs.columnInt(0));
+		eq(0, rs.columnInt(1));
+		rs.close();
+
+		// regexpi(): case-insensitive variant.
+		var ri = db.prepare("SELECT regexpi('^DEPLOY', 'deploy-42')");
+		t(ri.step());
+		eq(1, ri.columnInt(0));
+		ri.close();
+
+		// Math functions: pow/sqrt/floor/ln.
+		var m = db.prepare("SELECT pow(2, 10), sqrt(144.0), floor(3.7), ln(1.0)");
+		t(m.step());
+		eq(1024, m.columnInt(0));
+		t(m.columnFloat(1) == 12.0);
+		eq(3, m.columnInt(2));
+		t(m.columnFloat(3) == 0.0);
+		m.close();
 
 		db.close();
 	}

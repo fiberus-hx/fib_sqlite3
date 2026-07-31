@@ -42,14 +42,15 @@ echo ">> checkout hash: $HASH"
 # 3. Build the amalgamation (tclsh-driven)
 ( cd "$SRC" && ./configure >/dev/null && make sqlite3.c )
 
-# 4. Locate the three files and vendor them
+# 4. Locate the generated files (+ the regexp() extension) and vendor them
 C_FILE="$(find "$SRC" -maxdepth 2 -name sqlite3.c   | head -1)"
 H_FILE="$(find "$SRC" -maxdepth 2 -name sqlite3.h   | head -1)"
 E_FILE="$(find "$SRC" -maxdepth 3 -name sqlite3ext.h | head -1)"
-[ -n "$C_FILE" ] && [ -n "$H_FILE" ] && [ -n "$E_FILE" ] || { echo "ERROR: missing generated files"; exit 1; }
+R_FILE="$SRC/ext/misc/regexp.c"
+[ -n "$C_FILE" ] && [ -n "$H_FILE" ] && [ -n "$E_FILE" ] && [ -f "$R_FILE" ] || { echo "ERROR: missing generated files"; exit 1; }
 
 mkdir -p "$OUT"
-cp -f "$C_FILE" "$H_FILE" "$E_FILE" "$OUT/"
+cp -f "$C_FILE" "$H_FILE" "$E_FILE" "$R_FILE" "$OUT/"
 printf '%s  %s\n' "$HASH" "$BRANCH" > "$OUT/FOSSIL_HASH"
 
 VER="$(awk -F'"' '/#define SQLITE_VERSION /{print $2; exit}' "$OUT/sqlite3.h")"

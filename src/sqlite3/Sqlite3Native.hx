@@ -16,6 +16,8 @@ package sqlite3;
 		<compilerflag value="-DSQLITE_THREADSAFE=1"/>
 		<compilerflag value="-DSQLITE_OMIT_LOAD_EXTENSION"/>
 		<compilerflag value="-DSQLITE_ENABLE_FTS5"/>
+		<compilerflag value="-DSQLITE_ENABLE_MATH_FUNCTIONS"/>
+		<compilerflag value="-DSQLITE_CORE"/>
 	</files>
 ')
 @:include("fib_sqlite3.h")
@@ -23,6 +25,7 @@ package sqlite3;
 @:sourceFile("../../lib/fib_sqlite_mutex.c")
 @:sourceFile("../../lib/sqlite_vfs.c")
 @:sourceFile("../../lib/sqlite-begin-concurrent-20260628/sqlite3.c")
+@:sourceFile("../../lib/sqlite-begin-concurrent-20260628/regexp.c")
 extern class Sqlite3Native {
 	/* ====================================================================
 	 * Database Connection

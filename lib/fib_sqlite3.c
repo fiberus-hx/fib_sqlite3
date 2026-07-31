@@ -28,6 +28,12 @@
 /* gc_pin_object pins cross-fiber-shared objects at depth 0. */
 extern void gc_pin_object(void* obj);
 
+/* regexp() SQL function from the vendored ext/misc/regexp.c (compiled with
+ * SQLITE_CORE, so the pApi thunk is unused). Registered as an auto-extension
+ * in the one-shot init below so every connection gets it. */
+extern int sqlite3_regexp_init(sqlite3 *db, char **pzErrMsg,
+                               const struct sqlite3_api_routines *pApi);
+
 /* FibSqliteDb/FibSqliteStmt are malloc'd (not GC-managed) since they
  * contain only raw C pointers that the GC cannot trace.  Using the GC
  * heap (fibrix_alloc) with @:coreType Haxe types caused the GC
@@ -61,6 +67,9 @@ static inline void fib_sqlite_ensure_vfs_registered(void) {
                                     __ATOMIC_ACQUIRE)) {
         sqlite3_config(SQLITE_CONFIG_MUTEX, &fib_sqlite_mutex_methods);
         sqlite3_initialize();
+        /* AFTER initialize: sqlite3_auto_extension() itself calls
+         * sqlite3_initialize(), which must not run before the mutex config. */
+        sqlite3_auto_extension((void (*)(void))sqlite3_regexp_init);
         fib_sqlite_vfs_register();
         __atomic_store_n(&fib_sqlite_vfs_initialized, 2, __ATOMIC_RELEASE);
     } else {
