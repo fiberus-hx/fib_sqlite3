@@ -11,6 +11,12 @@
  *     xWrite() -> fib_io_pwrite_raw() -> IORING_OP_WRITE -> fiber suspends
  *     xSync()  -> fib_io_fsync()      -> IORING_OP_FSYNC -> fiber suspends
  *
+ * Fast path: xRead/xWrite first try preadv2/pwritev2 with RWF_NOWAIT, which completes at memory
+ * speed when the kernel can serve it from the page cache (the common case for a database that fits
+ * in RAM) and returns EAGAIN instead of blocking otherwise — only then does the fiber suspend on
+ * io_uring. A fiber that suspends on every cached page read lets its carrier run other fibers
+ * first, stretching every lock it holds (e.g. the write turn) by unrelated work.
+ *
  * All other VFS methods (open, close, lock, truncate, etc.) delegate directly
  * to the default Unix VFS since they are fast synchronous operations.
  *
@@ -28,6 +34,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -93,6 +101,12 @@ static int fib_vfs_read(sqlite3_file* pFile, void* zBuf, int iAmt, sqlite3_int64
     
     if (f->fd < 0) return SQLITE_IOERR_READ;
     
+    /* Page-cache hit: done without suspending. Anything short of a full read (not cached, EOF,
+     * unsupported) takes the io_uring path from the start, which also handles short reads. */
+    struct iovec iov = { zBuf, (size_t)iAmt };
+    ssize_t fast = preadv2(f->fd, &iov, 1, (off_t)iOfst, RWF_NOWAIT);
+    if (fast == (ssize_t)iAmt) return SQLITE_OK;
+
     ssize_t nRead = fib_io_pread_raw(f->fd, zBuf, (size_t)iAmt, (off_t)iOfst);
     
     if (nRead == (ssize_t)iAmt) {
@@ -123,6 +137,16 @@ static int fib_vfs_write(sqlite3_file* pFile, const void* zBuf, int iAmt, sqlite
     
     size_t total = 0;
     const char* src = (const char*)zBuf;
+
+    /* Buffered write that won't block: straight into the page cache. EAGAIN/EOPNOTSUPP or a
+     * partial write → the rest goes through io_uring below. */
+    static volatile int nowait_writes = 1;  /* 0 once the filesystem says EOPNOTSUPP (e.g. ext4) */
+    if (nowait_writes) {
+        struct iovec iov = { (void*)src, (size_t)iAmt };
+        ssize_t fast = pwritev2(f->fd, &iov, 1, (off_t)iOfst, RWF_NOWAIT);
+        if (fast > 0) total = (size_t)fast;
+        else if (fast < 0 && errno == EOPNOTSUPP) nowait_writes = 0;
+    }
     
     /* Write all data - handle partial writes by retrying */
     while (total < (size_t)iAmt) {
