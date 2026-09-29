@@ -17,6 +17,8 @@ package sqlite3;
 		<compilerflag value="-DSQLITE_OMIT_LOAD_EXTENSION"/>
 		<compilerflag value="-DSQLITE_ENABLE_FTS5"/>
 		<compilerflag value="-DSQLITE_ENABLE_MATH_FUNCTIONS"/>
+		<!-- no global memory counters: with them every SQLite malloc/free takes one process-wide mutex -->
+		<compilerflag value="-DSQLITE_DEFAULT_MEMSTATUS=0"/>
 		<compilerflag value="-DSQLITE_CORE"/>
 	</files>
 ')
@@ -154,7 +156,7 @@ extern class Sqlite3Native {
 	static function stmtIsNull(stmt:FibSqliteStmtPtr):Int;
 
 	/* ====================================================================
-	 * Memory telemetry
+	 * Memory telemetry (process-wide heap counters: 0 while SQLITE_DEFAULT_MEMSTATUS=0, see above)
 	 * ==================================================================== */
 
 	@:native("fib_sqlite_memory_used")

@@ -127,6 +127,10 @@ FibSqliteDb* fib_sqlite_open(const char* path) {
         if (db) sqlite3_close(db);
         return NULL;
     }
+    /* Plans never depend on bound values. Otherwise the planner marks parameters it looked at
+     * (e.g. `col = ?` on a non-indexed term) and every rebind expires the statement, so a cached
+     * statement is re-parsed on each run. */
+    sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_QPSG, 1, (int*)0);
 
     FibSqliteDb* fdb = (FibSqliteDb*)malloc(sizeof(FibSqliteDb));
     if (!fdb) {
@@ -413,6 +417,10 @@ FibSqliteDb* fib_sqlite_open_safe(FibString* path_str) {
         if (db) sqlite3_close(db);
         return NULL;
     }
+    /* Plans never depend on bound values. Otherwise the planner marks parameters it looked at
+     * (e.g. `col = ?` on a non-indexed term) and every rebind expires the statement, so a cached
+     * statement is re-parsed on each run. */
+    sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_QPSG, 1, (int*)0);
 
     FibSqliteDb* fdb = (FibSqliteDb*)malloc(sizeof(FibSqliteDb));
     if (!fdb) {
