@@ -50,6 +50,17 @@ typedef PoolConfig = {
 	/** Max distinct prepared statements cached per connection (default: 256).
 	 *  FIFO eviction — oldest insert is finalized when cap hit. */
 	?stmtCacheSize:Int,
+
+	/** Run write transactions one at a time (FIFO turn lock held from BEGIN to COMMIT) instead of
+	 *  optimistically in parallel. For workloads whose writes share hot pages (every transaction
+	 *  appends to the same table/index), where BEGIN CONCURRENT would only conflict and retry. */
+	?serialWrites:Bool,
+
+	/** Checkpoint the WAL in the background every N ms (when anything committed since the last
+	 *  pass) instead of SQLite's auto-checkpoint, which runs INSIDE the commit that crosses 1000
+	 *  pages and fsyncs there — every writer queued behind that commit waits (p99 spikes). PASSIVE:
+	 *  never blocks writers; its own connection + fiber, so the fsync parks only the checkpointer. */
+	?checkpointIntervalMs:Int,
 };
 
 /**
@@ -262,6 +273,18 @@ class ConnectionPool {
 	public var conflictRetries(default, null):AtomicInt;
 	/** transaction() calls that exhausted their retry budget and threw. */
 	public var retryExhaustions(default, null):AtomicInt;
+	/** Starvation guard: a transaction that keeps losing optimistic races takes this turn lock
+	 *  (FIFO); while any is escalated, fresh transactions queue behind it before BEGIN, so the
+	 *  starving writer only races transactions already in flight and is guaranteed to finish. */
+	var turnLock:CommitLock;
+	var escalated:AtomicInt;
+	/** Successful write commits (the background checkpointer skips idle intervals). */
+	var commits:AtomicInt;
+	/** Conflicts before escalating. 1: a writer that lost one race stops racing — contended writes
+	 *  (a hot row/page every transaction touches) then run serially instead of retrying, while
+	 *  uncontended ones stay fully concurrent. (16 measured ~6 wasted attempts per commit under a
+	 *  16-writer hot-row load: optimistic retries are costly when a fiber can be descheduled mid-txn.) */
+	static inline var ESCALATE_AFTER = 1;
 
 	function new(_path:String, _config:PoolConfig) {
 		path = _path;
@@ -274,6 +297,9 @@ class ConnectionPool {
 		commitLock = new CommitLock();
 		conflictRetries = new AtomicInt(0);
 		retryExhaustions = new AtomicInt(0);
+		turnLock = new CommitLock();
+		escalated = new AtomicInt(0);
+		commits = new AtomicInt(0);
 	}
 
 	/**
@@ -293,7 +319,12 @@ class ConnectionPool {
 		for (_ in 0...maxConn) {
 			pool.freeConns.push(pool.openNew());
 		}
+		var checkpointer:Connection = null;
+		if (config.checkpointIntervalMs != null && config.checkpointIntervalMs > 0)
+			checkpointer = Sqlite.open(dbPath);
 		untyped __fiberus__("gc_force_mature_end()");
+		if (checkpointer != null)
+			pool.startCheckpointer(checkpointer, config.checkpointIntervalMs);
 		return pool;
 	}
 
@@ -382,6 +413,18 @@ class ConnectionPool {
 	 * deadlock.
 	 */
 	public function transaction<T>(fn:PooledConnection -> T, maxRetries:Int = 256):T {
+		// Wait for the write turn BEFORE leasing a connection: a writer parked on the turn lock must
+		// not sit on one of the pool's few connections, or reads (and the writer next in line) starve.
+		var holding = false;
+		if (config.serialWrites == true) {
+			escalated.add(1);
+			turnLock.lock();
+			holding = true;
+		} else if (escalated.load() > 0) {
+			// Yield the turn to starving writers: queue behind them, then go.
+			turnLock.lock();
+			turnLock.unlock();
+		}
 		var pc = acquire();
 		GC.registerPendingRoot(fn);
 		var attempt = 0;
@@ -397,6 +440,11 @@ class ConnectionPool {
 					throw ce;
 				}
 				commitLock.unlock();
+				commits.add(1);
+				if (holding) {
+					escalated.sub(1);
+					turnLock.unlock();
+				}
 				pc.release();
 				GC.unregisterPendingRoot(fn);
 				return result;
@@ -408,12 +456,21 @@ class ConnectionPool {
 				if (conflict && attempt < maxRetries) {
 					attempt++;
 					conflictRetries.add(1);
+					if (attempt == ESCALATE_AFTER && !holding) {
+						escalated.add(1);
+						turnLock.lock();
+						holding = true;
+					}
 					// Escalating backoff: yield progressively more so contending
 					// fibers spread out instead of re-colliding in a thundering herd
 					// under heavy single-page contention.
 					var spins = attempt < 64 ? attempt : 64;
 					for (_ in 0...spins) Fiber.yield();
 					continue;
+				}
+				if (holding) {
+					escalated.sub(1);
+					turnLock.unlock();
 				}
 				pc.release();
 				GC.unregisterPendingRoot(fn);
@@ -489,6 +546,64 @@ class ConnectionPool {
 
 	// --- Internal ---
 
+	/**
+	 * WAL size (frames) above which the checkpointer restarts the WAL under the write turn. That pass
+	 * pauses writers for ~3.5 ms (it copies the frames written meanwhile: two fsyncs), so it must stay
+	 * rare: 128 MiB of 4 KiB pages ≈ every 2 s at 6k commits/s.
+	 */
+	static inline var WAL_RESTART_FRAMES = 32768;
+	/** The WAL file is cut back to this after a restart. */
+	static inline var WAL_SIZE_LIMIT = 16 * 1024 * 1024;
+
+	function startCheckpointer(conn:Connection, intervalMs:Int):Void {
+		// No busy handler: RESTART below runs while holding the write turn and must not sleep there
+		// (SQLite's handler sleeps 1, 2, 5, … ms); it reports busy at once and is retried after a yield.
+		conn.exec("PRAGMA busy_timeout=0");
+		Fiber.spawn(function(_):Void {
+			var seen = 0;
+			while (!closed) {
+				fiberus.io.Timer.sleep(intervalMs);
+				var n = commits.load();
+				if (n == seen)
+					continue;
+				seen = n;
+				try {
+					// Bulk pass: never blocks writers, and it copies the whole WAL.
+					if (checkpoint(conn, "PASSIVE").log > WAL_RESTART_FRAMES) {
+						// That alone never lets the WAL restart under steady writes: the next writer may
+						// restart it only if no reader still uses it, and by then new frames keep readers
+						// in it — the file grew without bound (~270 MB/s at 6k commits/s). Holding the
+						// write turn no frame is added; RESTART copies the frames written meanwhile and
+						// ensures readers left the WAL, so the next writer starts it over (and cuts it back
+						// to journal_size_limit).
+						escalated.add(1);
+						turnLock.lock();
+						try {
+							// Busy while a reader still uses the WAL: readers are short, so yield and retry
+							// (bounded; the next interval tries again).
+							for (_ in 0...64) {
+								if (checkpoint(conn, "RESTART").busy == 0)
+									break;
+								Fiber.yield();
+							}
+						} catch (_:Dynamic) {}
+						turnLock.unlock();
+						escalated.sub(1);
+					}
+				} catch (_:Dynamic) {}
+			}
+			conn.close();
+		});
+	}
+
+	/** PRAGMA wal_checkpoint(mode): busy (1 = could not finish) and the frames in the WAL. */
+	static function checkpoint(conn:Connection, mode:String):{busy:Int, log:Int} {
+		var rs = conn.prepare("PRAGMA wal_checkpoint(" + mode + ")");
+		var r = rs.step() ? {busy: rs.columnInt(0), log: rs.columnInt(1)} : {busy: 0, log: 0};
+		rs.close();
+		return r;
+	}
+
 	function openNew():PooledConnection {
 		var conn = Sqlite.open(path);
 		// begin-concurrent requires WAL; NORMAL is the WAL-safe durability default.
@@ -498,6 +613,11 @@ class ConnectionPool {
 		conn.exec("PRAGMA journal_mode=WAL");
 		conn.exec("PRAGMA synchronous=NORMAL");
 		conn.exec("PRAGMA busy_timeout=5000");
+		if (config.checkpointIntervalMs != null && config.checkpointIntervalMs > 0) {
+			conn.exec("PRAGMA wal_autocheckpoint=0"); // the background checkpointer does it
+			// The first commit after a WAL restart cuts the file back to this (applies per writer).
+			conn.exec("PRAGMA journal_size_limit=" + WAL_SIZE_LIMIT);
+		}
 		if (config.onConnect != null)
 			config.onConnect(conn);
 		var cacheSize = config.stmtCacheSize ?? 256;

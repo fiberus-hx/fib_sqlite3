@@ -19,6 +19,7 @@ class TestConcurrent extends Test {
 		testWalEnabled();
 		testBeginConcurrentSyntax();
 		testConcurrentIncrements();
+		testWalStaysBounded();
 	}
 
 	/** Fresh pool on a reset single-counter table. */
@@ -103,5 +104,68 @@ class TestConcurrent extends Test {
 		});
 		eq(K * N, total);
 		pool.close();
+	}
+
+	/**
+	 * With the background checkpointer (wal_autocheckpoint off), steady writes plus steady readers
+	 * never let SQLite restart the WAL on its own: it grew by the full write volume. The checkpointer
+	 * must restart it (under the write turn) once it passes its threshold (128 MiB).
+	 */
+	function testWalStaysBounded() {
+		framework.startTest("testWalStaysBounded");
+		var db = "bin/wal_bound_test.db";
+		for (f in [db, db + "-wal", db + "-shm"])
+			if (sys.FileSystem.exists(f)) sys.FileSystem.deleteFile(f);
+		var pool = ConnectionPool.create(db, {maxConnections: 4, serialWrites: true, checkpointIntervalMs: 20});
+		pool.transaction(pc -> {
+			pc.exec("CREATE TABLE b (id INTEGER PRIMARY KEY, v BLOB)");
+			return 0;
+		});
+		var WRITERS = 2, COMMITS = 4000; // 8000 commits x 16 pages of 4 KiB ≈ 512 MiB of WAL frames
+		var stop = new AtomicInt(0);
+		var maxWal = new AtomicInt(0);
+		var done = Counter.create(WRITERS + 2);
+		Fiber.spawn(_ -> { // steady readers keep the WAL in use
+			while (stop.load() == 0) {
+				pool.read(pc -> {
+					var rs = pc.prepare("SELECT count(*) FROM b");
+					rs.step();
+					rs.close();
+					return 0;
+				});
+				Fiber.yield(); // a cached read never suspends: let the writers on this carrier run
+			}
+			done.decrement();
+		});
+		Fiber.spawn(_ -> { // sample the WAL file size
+			while (stop.load() == 0) {
+				if (sys.FileSystem.exists(db + "-wal")) { // (FileSystem.stat is not implemented on fiberus)
+					var f = sys.io.File.read(db + "-wal", true);
+					f.seek(0, SeekEnd);
+					var mb = Std.int(f.tell() / (1024 * 1024));
+					f.close();
+					if (mb > maxWal.load()) maxWal.store(mb);
+				}
+				fiberus.io.Timer.sleep(5);
+			}
+			done.decrement();
+		});
+		var writersLeft = new AtomicInt(WRITERS);
+		for (w in 0...WRITERS) {
+			Fiber.spawn(_ -> {
+				for (i in 0...COMMITS)
+					pool.transaction(pc -> {
+						pc.exec("INSERT OR REPLACE INTO b (id, v) VALUES (" + ((w * COMMITS + i) % 64) + ", zeroblob(65536))");
+						return 0;
+					});
+				if (writersLeft.sub(1) == 1) stop.store(1);
+				done.decrement();
+			});
+		}
+		done.wait(0);
+		done.done();
+		pool.close();
+		t(maxWal.load() < 256); // bounded: threshold (128 MiB) + one interval of writes, not ~512 MiB
+		trace('  max WAL ${maxWal.load()} MiB for ~${Std.int(WRITERS * COMMITS * 68 / 1024)} MiB written');
 	}
 }
