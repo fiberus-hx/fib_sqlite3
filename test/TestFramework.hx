@@ -113,6 +113,7 @@ class TestFramework {
 			trace("ALL TESTS PASSED!");
 		} else {
 			trace("SOME TESTS FAILED!");
+			Sys.exit(1); // a red suite must fail the process (CI, make run)
 		}
 	}
 }

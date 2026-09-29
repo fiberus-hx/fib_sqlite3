@@ -139,11 +139,8 @@ class TestConcurrent extends Test {
 		});
 		Fiber.spawn(_ -> { // sample the WAL file size
 			while (stop.load() == 0) {
-				if (sys.FileSystem.exists(db + "-wal")) { // (FileSystem.stat is not implemented on fiberus)
-					var f = sys.io.File.read(db + "-wal", true);
-					f.seek(0, SeekEnd);
-					var mb = Std.int(f.tell() / (1024 * 1024));
-					f.close();
+				if (sys.FileSystem.exists(db + "-wal")) {
+					var mb = Std.int(sys.FileSystem.stat(db + "-wal").size / (1024 * 1024));
 					if (mb > maxWal.load()) maxWal.store(mb);
 				}
 				fiberus.io.Timer.sleep(5);
