@@ -20,6 +20,8 @@ package sqlite3;
 		<!-- no global memory counters: with them every SQLite malloc/free takes one process-wide mutex -->
 		<compilerflag value="-DSQLITE_DEFAULT_MEMSTATUS=0"/>
 		<compilerflag value="-DSQLITE_CORE"/>
+		<!-- upstream math funcs use argc only in assert(); NDEBUG drops it -->
+		<compilerflag value="-Wno-unused-parameter"/>
 	</files>
 ')
 @:include("fib_sqlite3.h")
